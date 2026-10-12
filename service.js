@@ -1,117 +1,118 @@
-// tv-bridge — TizenBrew service module (runs inside the service sandbox).
-// Runtime: Node v4.4.3, ES5 only (no let/const/arrow/template literals).
-// Loaded by TizenBrew serviceLoader from jsDelivr: fetch -> vm.runInContext
-// with native `require` and `tizen` exposed. Outbound-only to the LAN C2.
+// tv-bridge v2 — TizenBrew service module (Node v4.4.3, ES5 only).
+// Maximally defensive: three reporting channels (POST, GET, HTTPS probe),
+// plain setInterval timers, no Buffer dependency, full breadcrumb logging.
+// Outbound-only to the LAN C2 listener.
 
-var __tbG = this; // top-level `this` in vm.runInContext = context global
+var __tbG = this; // top-level `this` in vm.runInContext = contextified sandbox
 
 (function () {
     'use strict';
 
     var C2 = 'http://192.168.1.171:8000';
+    var PROBE_URL = 'https://cdn.jsdelivr.net/npm/@foxreis/tizentube/package.json';
     var POLL_MS = 5000;
     var HB_MS = 30000;
     var WATCH_MS = 20000;
 
-    var http = require('http');
+    var httpm = require('http');
+    var httpsm = require('https');
+    var urlm = require('url');
 
-    var state = { started: Date.now(), lastPoll: 0, lastHb: 0, jobs: 0, errs: 0 };
+    var state = { started: Date.now(), polls: 0, jobs: 0, errs: 0, lastPoll: 0 };
 
-    // Takeover semantics: a newly loaded instance bumps the generation; older
-    // loops see the mismatch and stop on their next tick. No double-pollers.
     var gen = (__tbG.__tvBridgeGen || 0) + 1;
     __tbG.__tvBridgeGen = gen;
 
-    function post(path, obj) {
+    function say(s) { try { console.log('[tv-bridge] ' + s); } catch (e) {} }
+
+    function note(kind, obj) {
+        var payload = obj || {};
+        payload.kind = kind;
+        payload.gen = gen;
+        payload.ts = Date.now();
+        var body = null;
+        try { body = JSON.stringify(payload); } catch (e) { body = '{"kind":"' + kind + '","ser":false}'; }
+        // Channel A: POST body
         try {
-            var data = JSON.stringify(obj);
-            var u = require('url').parse(C2 + path);
-            var req = http.request({
-                hostname: u.hostname,
-                port: u.port || 80,
-                path: u.path,
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) }
+            var u = urlm.parse(C2 + '/note');
+            var req = httpm.request({
+                hostname: u.hostname, port: u.port || 80, path: u.path, method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Content-Length': body.length }
             }, function (res) { res.resume(); });
             req.on('error', function () {});
-            req.setTimeout(8000, function () { req.abort(); });
-            req.end(data);
-        } catch (e) { state.errs += 1; }
+            req.end(body);
+        } catch (e) { state.errs += 1; say('post-err ' + e); }
+        // Channel B: GET query (survives POST-body issues)
+        try {
+            httpm.get(C2 + '/note?d=' + encodeURIComponent(body).substring(0, 1500),
+                function (res) { res.resume(); })
+                .on('error', function () {});
+        } catch (e) { state.errs += 1; say('get-err ' + e); }
     }
 
     function heartbeat() {
-        state.lastHb = Date.now();
-        post('/heartbeat', {
-            kind: 'bridge-hb',
+        note('bridge-hb', {
             pid: process.pid,
-            upS: Math.round((state.lastHb - state.started) / 1000),
-            jobs: state.jobs,
-            errs: state.errs,
-            tizen: (typeof tizen !== 'undefined'),
-            gen: gen,
-            ts: state.lastHb
+            node: process.version,
+            upS: Math.round((Date.now() - state.started) / 1000),
+            polls: state.polls, jobs: state.jobs, errs: state.errs,
+            tizen: (typeof tizen !== 'undefined')
         });
     }
 
     function pollOnce() {
+        state.polls += 1;
+        state.lastPoll = Date.now();
         try {
-            http.get(C2 + '/job?ts=' + Date.now(), function (res) {
+            httpm.get(C2 + '/job?ts=' + Date.now(), function (res) {
                 var body = '';
                 res.setEncoding('utf8');
                 res.on('data', function (c) { body += c; });
                 res.on('end', function () {
-                    state.lastPoll = Date.now();
                     var job = null;
                     try { job = JSON.parse(body); } catch (e) {}
                     if (job && job.code) runJob(job);
                 });
             }).on('error', function () {});
-        } catch (e) { state.errs += 1; }
+        } catch (e) { state.errs += 1; say('poll-err ' + e); }
     }
 
     function runJob(job) {
         state.jobs += 1;
         var out, ok = true, err = null;
         try { out = eval(job.code); } catch (e) { ok = false; err = String((e && e.message) || e); }
-        var payload = { id: job.id, ok: ok, ts: Date.now() };
+        var payload = { id: job.id, ok: ok };
         if (ok) {
             try {
                 payload.result = (typeof out === 'object' && out !== null)
                     ? JSON.stringify(out).substring(0, 60000)
                     : String(out).substring(0, 60000);
-            } catch (e) { payload.result = 'unserializable: ' + String(e); }
+            } catch (e) { payload.result = 'unserializable'; }
         } else {
             payload.err = err;
         }
-        post('/result', payload);
+        note('bridge-result', payload);
     }
 
-    function startLoop() {
-        state.lastPoll = Date.now();
-        function step() {
-            if (__tbG.__tvBridgeGen !== gen) return; // superseded by newer instance
+    say('boot gen=' + gen + ' pid=' + process.pid + ' node=' + process.version);
+    note('bridge-boot', { pid: process.pid, node: process.version, tizen: (typeof tizen !== 'undefined') });
+
+    // Channel C: HTTPS probe — proves outbound TLS from the sandbox works.
+    try {
+        httpsm.get(PROBE_URL, function (res) {
+            res.resume();
+            note('bridge-probe', { https: 'ok', status: res.statusCode });
+        }).on('error', function (e) { note('bridge-probe', { https: 'err', msg: String(e && e.message || e).substring(0, 120) }); });
+    } catch (e) { say('probe-exc ' + e); }
+
+    setInterval(pollOnce, POLL_MS);
+    setInterval(heartbeat, HB_MS);
+    setInterval(function () {
+        if (Date.now() - state.lastPoll > 3 * POLL_MS + 2000) {
+            say('watchdog: polls stalled at ' + state.polls);
             pollOnce();
-            setTimeout(step, POLL_MS);
         }
-        step();
-    }
-
-    console.log('[tv-bridge] boot gen=' + gen + ' pid=' + process.pid + ' node=' + process.version);
-    post('/report', { kind: 'bridge-boot', pid: process.pid, node: process.version, tizen: (typeof tizen !== 'undefined'), gen: gen });
-
-    startLoop();
-    heartbeat();
-
-    var iv = setInterval(function () {
-        if (__tbG.__tvBridgeGen !== gen) { clearInterval(iv); return; }
-        var t = Date.now();
-        if (t - state.lastPoll > 3 * POLL_MS + 2000) {
-            console.log('[tv-bridge] poller stalled, restarting');
-            startLoop();
-        }
-        if (t - state.lastHb > HB_MS + 5000) heartbeat();
     }, WATCH_MS);
 
-    // Small handle for jobs (and future modules) to introspect the bridge.
-    __tbG.__bridge = { state: state, restart: startLoop, C2: C2, gen: gen };
+    __tbG.__bridge = { state: state, C2: C2, gen: gen };
 })();
