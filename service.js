@@ -52,7 +52,7 @@ var __tbG = this; // top-level `this` in vm.runInContext = contextified sandbox
         try {
             // Explicit scope: guarantee require/module availability inside job code
             // regardless of how the host sandbox exposed globals.
-            out = eval('(function(require,module){' + job.code + '\n})')(require, { exports: {} });
+            out = eval('(function(require,module){return (' + job.code + '\n)})')(require, { exports: {} });
         } catch (e) { ok = false; err = String((e && e.message) || e); }
         var payload = { id: job.id, ok: ok };
         if (ok) {
